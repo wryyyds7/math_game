@@ -15,13 +15,23 @@ namespace MathGame.TurnManagement
         private IPlayerManager playerManager;
         private IShootingSystem shootingSystem;
         private IMathParser mathParser;
+        private IAIModule aiModule;
 
         private TurnStateMachine stateMachine;
         private ActionResolver actionResolver;
 
         public int CurrentTurnNumber { get; private set; } = 0;
         public GamePhase CurrentPhase { get; private set; } = GamePhase.WaitingForPlayers;
+        public bool IsCurrentPlayerAI
+        {
+            get
+            {
+                var p = playerManager?.GetCurrentPlayer();
+                return p != null && p.IsAI;
+            }
+        }
         private float turnTimer;
+        private bool aiActionReceived;
 
         private void Awake()
         {
@@ -29,6 +39,7 @@ namespace MathGame.TurnManagement
             playerManager = FindObjectOfType<PlayerManager>();
             shootingSystem = FindObjectOfType<ShootingSystem>();
             mathParser = FindObjectOfType<MathParser>();
+            aiModule = FindObjectOfType<AI.AIModule>();
 
             stateMachine = new TurnStateMachine();
             actionResolver = new ActionResolver
@@ -40,12 +51,12 @@ namespace MathGame.TurnManagement
             };
         }
 
-        public void StartGame(int playerCount)
+        public void StartGame(int playerCount, int aiCount = 0, Difficulty aiDifficulty = Difficulty.Normal)
         {
-            StartCoroutine(GameFlow(playerCount));
+            StartCoroutine(GameFlow(playerCount, aiCount, aiDifficulty));
         }
 
-        private IEnumerator GameFlow(int playerCount)
+        private IEnumerator GameFlow(int playerCount, int aiCount, Difficulty aiDifficulty)
         {
             // 阶段1: 生成地图
             SetPhase(GamePhase.GeneratingMap);
@@ -56,7 +67,23 @@ namespace MathGame.TurnManagement
             SetPhase(GamePhase.WaitingForPlayers);
             for (int i = 0; i < playerCount; i++)
             {
-                playerManager.SpawnPlayer($"玩家{i + 1}");
+                playerManager.SpawnPlayer($"玩家{i + 1}", isAI: false);
+            }
+            // 生成AI玩家
+            if (aiCount > 0 && aiModule != null)
+            {
+                aiModule.Initialize(aiDifficulty);
+                for (int i = 0; i < aiCount; i++)
+                {
+                    string aiName = aiDifficulty switch
+                    {
+                        Difficulty.Easy => $"简单AI-{i + 1}",
+                        Difficulty.Normal => $"普通AI-{i + 1}",
+                        Difficulty.Hard => $"困难AI-{i + 1}",
+                        _ => $"AI-{i + 1}"
+                    };
+                    playerManager.SpawnPlayer(aiName, isAI: true);
+                }
             }
             yield return new WaitForSeconds(1f);
 
@@ -65,6 +92,7 @@ namespace MathGame.TurnManagement
             {
                 CurrentTurnNumber++;
                 var allPlayers = playerManager.GetAllPlayers();
+                var obstacles = sceneManager.Obstacles;
 
                 for (int i = 0; i < allPlayers.Count; i++)
                 {
@@ -74,17 +102,25 @@ namespace MathGame.TurnManagement
                     SetPhase(GamePhase.PlayerTurn);
                     GameEvent.OnTurnStarted?.Invoke(CurrentTurnNumber);
 
-                    // 等待玩家提交动作
-                    turnTimer = turnTimeLimit;
-                    while (!player.HasActedThisTurn)
+                    if (player.IsAI && aiModule != null)
                     {
-                        turnTimer -= Time.deltaTime;
-                        if (turnTimeLimit > 0 && turnTimer <= 0)
+                        // === AI回合 ===
+                        yield return HandleAITurn(player, allPlayers, obstacles);
+                    }
+                    else
+                    {
+                        // === 人类回合 ===
+                        turnTimer = turnTimeLimit;
+                        while (!player.HasActedThisTurn)
                         {
-                            SkipCurrentPlayer();
-                            break;
+                            turnTimer -= Time.deltaTime;
+                            if (turnTimeLimit > 0 && turnTimer <= 0)
+                            {
+                                SkipCurrentPlayer();
+                                break;
+                            }
+                            yield return null;
                         }
-                        yield return null;
                     }
 
                     // 结算动作
@@ -107,16 +143,47 @@ namespace MathGame.TurnManagement
             GameEvent.OnGameOver?.Invoke(winner?.PlayerID ?? -1);
         }
 
+        /// <summary>处理AI玩家的回合</summary>
+        private IEnumerator HandleAITurn(PlayerState aiPlayer,
+                                          System.Collections.Generic.List<PlayerState> allPlayers,
+                                          System.Collections.Generic.List<ObstacleData> obstacles)
+        {
+            aiActionReceived = false;
+
+            aiModule.Think(aiPlayer, allPlayers, obstacles, (action, data) =>
+            {
+                SubmitAction(aiPlayer.PlayerID, action, data);
+                aiActionReceived = true;
+            });
+
+            // 等待AI决策完成（最多等30秒，防止死循环）
+            float waitTime = 0;
+            while (!aiActionReceived && waitTime < 30f)
+            {
+                waitTime += Time.deltaTime;
+                yield return null;
+            }
+
+            if (!aiActionReceived)
+            {
+                Debug.LogWarning($"[TurnManager] AI {aiPlayer.PlayerName} 超时，强制跳过");
+                SkipCurrentPlayer();
+            }
+        }
+
         public void SubmitAction(int playerID, TurnActionType action, object actionData)
         {
             var player = playerManager.GetPlayer(playerID);
-            if (player == null || player.PlayerID != GetCurrentPlayerID()) return;
+            if (player == null || !player.IsAlive) return;
             if (player.HasActedThisTurn) return;
+
+            // 当前玩家检查（AI回合时放宽限制）
+            if (!player.IsAI && player.PlayerID != GetCurrentPlayerID()) return;
 
             player.HasActedThisTurn = true;
             actionResolver.QueueAction(playerID, action, actionData);
             GameEvent.OnPlayerActionSelected?.Invoke(playerID, action);
-            Debug.Log($"[TurnManager] 玩家{playerID} 提交动作: {action}");
+            Debug.Log($"[TurnManager] {player.PlayerName} 提交动作: {action}");
         }
 
         public void SkipCurrentPlayer()

@@ -13,6 +13,7 @@ namespace MathGame.Core
     /// <summary>
     /// GameBootstrap — 游戏入口，挂在场景中的空GameObject上
     /// 负责初始化依赖注入和启动游戏
+    /// V2: 支持人机模式 + 模式选择
     /// </summary>
     public class GameBootstrap : MonoBehaviour
     {
@@ -26,6 +27,7 @@ namespace MathGame.Core
         [SerializeField] private ShootingSystem shootingSystem;
         [SerializeField] private TurnManager turnManager;
         [SerializeField] private UIManager uiManager;
+        [SerializeField] private AI.AIModule aiModule;
 
         private ITurnManager ITurnManager => turnManager;
         private IUIManager IUIManager => uiManager;
@@ -33,7 +35,9 @@ namespace MathGame.Core
 
         [Header("测试模式")]
         [SerializeField] private bool autoStart = false;
-        [SerializeField] private int testPlayerCount = 2;
+        [SerializeField] private int autoHumanCount = 1;
+        [SerializeField] private int autoAICount = 1;
+        [SerializeField] private Difficulty autoAIDifficulty = Difficulty.Normal;
 
         private void Awake()
         {
@@ -44,6 +48,7 @@ namespace MathGame.Core
             if (shootingSystem == null) shootingSystem = FindObjectOfType<ShootingSystem>();
             if (turnManager == null) turnManager = FindObjectOfType<TurnManager>();
             if (uiManager == null) uiManager = FindObjectOfType<UIManager>();
+            if (aiModule == null) aiModule = FindObjectOfType<AI.AIModule>();
         }
 
         private void Start()
@@ -51,7 +56,10 @@ namespace MathGame.Core
             // 监听UI事件
             if (uiManager != null)
             {
-                uiManager.OnStartGameClicked += HandleStartGame;
+                // 新版：带模式的开始游戏
+                uiManager.OnGameStartRequested += HandleGameStartWithMode;
+                // 旧版兼容
+                uiManager.OnStartGameClicked += () => HandleGameStartWithMode(GameMode.PvP, Difficulty.Normal);
                 uiManager.OnShootSubmitted += HandleShoot;
                 uiManager.OnBlinkSubmitted += HandleBlink;
                 uiManager.OnRotateSubmitted += HandleRotate;
@@ -61,13 +69,20 @@ namespace MathGame.Core
             GameEvent.OnTurnStarted += HandleTurnStarted;
             GameEvent.OnPhaseChanged += HandlePhaseChanged;
             GameEvent.OnPlayerEliminated += HandlePlayerEliminated;
+
+            // 自动开始测试
+            if (autoStart)
+            {
+                HandleGameStartWithMode(autoAICount > 0 ? GameMode.PvAI : GameMode.PvP, autoAIDifficulty);
+            }
         }
 
         private void OnDestroy()
         {
             if (uiManager != null)
             {
-                uiManager.OnStartGameClicked -= HandleStartGame;
+                uiManager.OnGameStartRequested -= HandleGameStartWithMode;
+                uiManager.OnStartGameClicked -= () => HandleGameStartWithMode(GameMode.PvP, Difficulty.Normal);
                 uiManager.OnShootSubmitted -= HandleShoot;
                 uiManager.OnBlinkSubmitted -= HandleBlink;
                 uiManager.OnRotateSubmitted -= HandleRotate;
@@ -81,27 +96,37 @@ namespace MathGame.Core
 
         // ===== 事件处理 =====
 
+        /// <summary>新版开始游戏：支持模式选择</summary>
+        public void HandleGameStartWithMode(GameMode mode, Difficulty difficulty)
+        {
+            Debug.Log($"[GameBootstrap] 开始游戏 — 模式:{mode}, 难度:{difficulty}");
+            uiManager.ShowGameHUD();
+
+            int humanCount = mode == GameMode.PvAI ? 1 : 2;
+            int aiCount = mode == GameMode.PvAI ? 1 : 0;
+
+            turnManager.StartGame(humanCount, aiCount, difficulty);
+        }
+
         public void HandleStartGame()
         {
-            Debug.Log("[GameBootstrap] 开始游戏");
+            // 兼容旧版：默认PvP
+            Debug.Log("[GameBootstrap] 开始游戏 (旧版兼容)");
             uiManager.ShowGameHUD();
-            turnManager.StartGame(testPlayerCount);
+            turnManager.StartGame(2, 0);
         }
 
         private void HandleShoot(string expression)
         {
             int playerID = turnManager.GetCurrentPlayerID();
             var player = playerManager.GetPlayer(playerID);
+            if (player == null || player.IsAI) return; // AI不通过UI提交
 
-            if (player != null)
+            if (!string.IsNullOrEmpty(expression))
             {
-                // 先预览曲线
                 var curve = mathParser.ParseAndGenerate(
                     expression, player.Position, player.Rotation, gameConfig.MaxCurveLength);
                 uiManager.UpdateCurvePreview(curve);
-
-                // 提交射击（确认后再调用）
-                // 这里简化：直接提交
             }
             turnManager.SubmitAction(playerID, TurnActionType.Shoot, expression);
         }
@@ -109,20 +134,25 @@ namespace MathGame.Core
         private void HandleBlink(Vector2 target)
         {
             int playerID = turnManager.GetCurrentPlayerID();
-            // target 由地图点击系统提供，这里简化
             var player = playerManager.GetPlayer(playerID);
-            if (player != null)
+            if (player == null || player.IsAI) return;
+
+            // 默认闪现到前方半程
+            Vector2 blinkTarget = target;
+            if (target == Vector2.zero)
             {
-                // 默认闪现到前方半程
-                Vector2 blinkTarget = player.Position +
+                blinkTarget = player.Position +
                     player.Forward * player.BlinkRange(gameConfig.MapWidth, gameConfig.MapHeight) * 0.5f;
-                turnManager.SubmitAction(playerID, TurnActionType.Blink, blinkTarget);
             }
+            turnManager.SubmitAction(playerID, TurnActionType.Blink, blinkTarget);
         }
 
         private void HandleRotate()
         {
             int playerID = turnManager.GetCurrentPlayerID();
+            var player = playerManager.GetPlayer(playerID);
+            if (player == null || player.IsAI) return;
+
             turnManager.SubmitAction(playerID, TurnActionType.Rotate180, null);
         }
 
@@ -142,13 +172,14 @@ namespace MathGame.Core
             switch (phase)
             {
                 case GamePhase.PlayerTurn:
-                    uiManager.ShowActionPanel();
+                    var current = playerManager.GetCurrentPlayer();
+                    if (current != null && !current.IsAI)
+                        uiManager.ShowActionPanel();
                     break;
                 case GamePhase.TurnEnd:
                     uiManager.HideActionPanel();
                     break;
                 case GamePhase.GameOver:
-                    // GameOver由UIManager监听GameEvent处理
                     break;
             }
         }
